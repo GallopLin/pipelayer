@@ -50,6 +50,7 @@ class PipelayerModelWrapper(nn.Module):
         self._hook_wait_log: List[Tuple[int, float, float]] = []  # (chunk_id, wait_start, blocked_duration)
         self._first_forward_time: float = 0.0
         self._pipelining_verified = False
+        self._extra_state_cache: Dict[str, Any] | None = None
 
         # 注册清理函数
         atexit.register(self.cleanup)
@@ -93,14 +94,20 @@ class PipelayerModelWrapper(nn.Module):
         assert self.loader is not None
 
         # 1) 建立 module_name -> 所需 chunk_ids 的映射
+        # split 分组下一个参数可横跨多个 chunk：必须等待全部覆盖 chunk（正确性
+        # 要求，非优化）。param_name_to_chunks 由 MultiStreamStateLoader 提供，
+        # 旧 loader 回退到单值映射。
+        name_to_chunks = getattr(self.loader, "param_name_to_chunks", None)
+        if not name_to_chunks:
+            name_to_chunks = {k: {v} for k, v in self.loader.param_name_to_chunk.items()}
         module_to_chunks: Dict[str, Set[int]] = defaultdict(set)
-        for pname, chunk_id in self.loader.param_name_to_chunk.items():
+        for pname, chunk_ids in name_to_chunks.items():
             # pname 形如 "model.decoder.layers.0.self_attn.k_proj.weight"
             # 取最后一个 "." 之前的部分作为 module_name
             dot_pos = pname.rfind(".")
             if dot_pos > 0:
                 module_name = pname[:dot_pos]
-                module_to_chunks[module_name].add(chunk_id)
+                module_to_chunks[module_name].update(chunk_ids)
 
         # 2) 在对应模块上注册 pre-hook
         all_modules = dict(self.original_model.named_modules())
@@ -171,9 +178,15 @@ class PipelayerModelWrapper(nn.Module):
         monitor_thread.start()
 
     def _check_chunk_loaded(self, chunk_idx: int) -> bool:
-        """非阻塞检查块是否已加载完成"""
+        """非阻塞检查块是否已【完整】加载（含 optimizer 状态流）。
+
+        weights-first 下 param 先就绪不算完成——若按 param 判据，监控线程会
+        提前 stop loader，杀掉第二阶段（moments/master）的恢复。
+        """
         if self.loader is None:
             return False
+        if hasattr(self.loader, "is_chunk_fully_loaded"):
+            return self.loader.is_chunk_fully_loaded(chunk_idx)
         return self.loader.is_chunk_loaded(chunk_idx)
 
     def _print_pipelining_report(self, chunk_load_times: Dict[int, float]) -> None:
@@ -216,14 +229,34 @@ class PipelayerModelWrapper(nn.Module):
         else:
             print(f"\n  No hook blocking events (all chunks ready before forward)")
 
+        # weights-first：param-ready vs full-ready 双时间线（恢复侧重叠证据）
+        loader = self.loader
+        pt = getattr(loader, "_param_ready_time", None)
+        ft = getattr(loader, "_full_ready_time", None)
+        if getattr(loader, "weights_first", False) and pt:
+            print(f"\n  [weights-first] param-ready vs full-ready (s since loader init):")
+            for cid in sorted(pt):
+                fr = (ft or {}).get(cid)
+                full_desc = f"full T+{fr:.3f}" if fr is not None else "full pending"
+                print(f"    Chunk {cid}: param T+{pt[cid]:.3f}  {full_desc}")
+
         print("=" * 60 + "\n")
 
     def _finish_loading(self) -> None:
-        """加载完成：移除 hook、释放 loader 资源。"""
+        """加载完成：移除 hook、释放 loader 资源。
+
+        释放前缓存 extra state（非分层状态 blob）——loader 释放后 reader 句柄
+        关闭，finish_optimizer_state 若晚于监控线程到达仍能拿到状态。
+        """
         self._loading_complete.set()
         self._remove_chunk_wait_hooks()
 
         if self.loader:
+            if self._extra_state_cache is None and hasattr(self.loader, "load_extra_state"):
+                try:
+                    self._extra_state_cache = self.loader.load_extra_state()
+                except Exception as e:
+                    print(f"[PipeLayer] extra-state read failed during finish: {e}")
             self.loader.stop()
             self.loader = None
 
@@ -231,6 +264,28 @@ class PipelayerModelWrapper(nn.Module):
         gc.collect()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+
+    def finish_optimizer_state(self, scheduler=None, scaler=None, set_rng: bool = True):
+        """首次 optimizer.step() 前调用：等待全部状态流（moments/master）恢复
+        完成，并应用非分层状态（RNG/LR scheduler/grad scaler）。
+
+        Returns: extra blob 的 user dict（如 dataloader 位置），无则 None。
+        """
+        loader = self.loader
+        extra = None
+        if loader is not None:
+            if hasattr(loader, "wait_all_full"):
+                loader.wait_all_full()
+            if hasattr(loader, "load_extra_state"):
+                extra = loader.load_extra_state()
+        if extra is None:
+            extra = self._extra_state_cache
+        if extra is None:
+            return None
+        self._extra_state_cache = extra
+        from .checkpointing import MultiStreamStateLoader
+        return MultiStreamStateLoader.apply_extra_state(
+            extra, scheduler=scheduler, scaler=scaler, set_rng=set_rng)
 
     # ------------------------------------------------------------------
     # Forward

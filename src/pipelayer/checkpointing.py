@@ -1,51 +1,53 @@
 from __future__ import annotations
 
 import atexit
+import importlib.util
 import json
 import os
 import queue
+import random
 import shutil
+import sys
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Callable, List, Optional, Tuple
 
 from ctypes import cdll, c_void_p, c_char_p, c_int, c_size_t, POINTER
 
+import numpy as np
 import torch
 import torch.nn as nn
 
-
-@dataclass(frozen=True)
-class _LayerGroupManifest:
-    group_idx: int
-    chunk_key: str
-    forward_order: int
-    layer_ids: Tuple[int, ...]
-    param_names: Tuple[str, ...]
-    chunk_meta: Dict[str, Any]
-
-
-@dataclass(order=True)
-class _RestoreTask:
-    priority: int
-    sequence: int
-    group_idx: int = field(compare=False)
-    phase: str = field(compare=False)
-    streams: Tuple[str, ...] = field(compare=False)
-    chunk_meta: Dict[str, Any] = field(compare=False)
+# ---------------------------------------------------------------------------
+# v3 格式权威：保存侧 multistream_checkpoint.py 是布局/量化/blob 格式的唯一定义，
+# 恢复端 import 复用（piece_extent/_quant_unit_floats/parse_extra_state_blob），
+# 避免格式出现第三份拷贝。查找顺序：常规 import → PCCHECK_MS_DIR → 默认路径。
+# ---------------------------------------------------------------------------
+_MS_FORMAT_DIR_ENV = "PCCHECK_MS_DIR"
+_MS_FORMAT_DEFAULT_DIR = "/home/linzhicheng/code/pccheck/checkpoint_eval/pccheck"
+_ms_format_module = None
 
 
-@dataclass(order=True)
-class _BufferedRestoreTask:
-    priority: int
-    sequence: int
-    group_idx: int = field(compare=False)
-    phase: str = field(compare=False)
-    streams: Tuple[str, ...] = field(compare=False)
-    buffers: Dict[str, torch.Tensor] = field(compare=False)
-    chunk_meta: Dict[str, Any] = field(compare=False)
+def _ms_format():
+    """加载保存侧格式模块 multistream_checkpoint（惰性、进程内单例）。"""
+    global _ms_format_module
+    if _ms_format_module is None:
+        try:
+            import multistream_checkpoint as m  # 调用方已注入 sys.path 的情形
+        except ImportError:
+            ms_dir = os.environ.get(_MS_FORMAT_DIR_ENV, _MS_FORMAT_DEFAULT_DIR)
+            path = os.path.join(ms_dir, "multistream_checkpoint.py")
+            if not os.path.exists(path):
+                raise ImportError(
+                    f"multistream_checkpoint.py not found at {path}; "
+                    f"set {_MS_FORMAT_DIR_ENV} to the pccheck directory")
+            spec = importlib.util.spec_from_file_location("multistream_checkpoint", path)
+            m = importlib.util.module_from_spec(spec)
+            sys.modules["multistream_checkpoint"] = m
+            spec.loader.exec_module(m)
+        _ms_format_module = m
+    return _ms_format_module
 
 
 def save_model_chunked(
@@ -301,7 +303,7 @@ class PipelinedStateLoader:
                 if new_group["params"]:
                     new_param_groups.append(new_group)
             self.optimizer.param_groups = new_param_groups
-            self.optimizer.state = defaultdict(dict)
+            self.optimizer.state = {}
 
     def _io_producer_loop(self) -> None:
         """IO 线程：按 chunk 顺序从磁盘 load 到 CPU 并 pin memory，然后放 queue"""
@@ -348,7 +350,7 @@ class PipelinedStateLoader:
             print(f"[ERROR] Copy worker thread error (idx={worker_idx}): {e}")
             self.copy_worker_stop_event.set()
 
-    def _copy_worker_loop_impl(self, worker_idx: int) -> None:
+    def _copy_worker_loop_impl(self, worker_idx: int, stream: Optional["torch.cuda.Stream"]) -> None:  # type: ignore[name-defined]
         while not (self.copy_worker_stop_event.is_set() and self.host_buffer_queue.empty()):
             try:
                 item = self.host_buffer_queue.get(timeout=0.2)
@@ -360,11 +362,6 @@ class PipelinedStateLoader:
             chunk_idx, host_model_chunk, host_optim_chunk = item
             try:
                 if self.device.type == "cuda":
-                    stream = (
-                        self.update_copy_streams[worker_idx]
-                        if task.phase == "update"
-                        else self.weight_copy_streams[worker_idx]
-                    )
                     assert stream is not None
                     with torch.cuda.stream(stream):
                         self._apply_model_chunk(host_model_chunk)
@@ -462,8 +459,6 @@ class MultiStreamStateLoader:
 
     - C++ 侧负责 mmap + 按 stream/offset 拷贝到 CPU pinned buffer。
     - Python 侧负责异步拷贝到 device，并原位更新参数与优化器状态。
-    - 恢复状态拆成 forward-ready（param）和 update-ready（grad/Adam state）。
-    - 调度采用 window interleave：保持 forward weights 预取窗口，同时穿插 optimizer state。
     """
 
     def __init__(
@@ -477,10 +472,12 @@ class MultiStreamStateLoader:
         device: str = "cuda:0",
         host_queue_maxsize: int = 32,
         num_copy_workers: Optional[int] = None,
-        load_grad: bool = False,
+        load_grad: bool = False,          # v3 无 grad 流，保留参数仅为兼容旧调用方
         parall_iter: Optional[int] = None,
-        forward_prefetch_window: int = 2,
-        restore_schedule_policy: str = "window_interleave",
+        master_applier: Optional[Callable] = None,  # (param, flat_slice, ps, pe) -> None
+        weights_first: Optional[bool] = None,       # None → 读 PIPELAYER_WEIGHTS_FIRST
+        forward_prefetch_window: int = 2,           # distributed 分支调度参数；v3 的
+        restore_schedule_policy: str = "window_interleave",  # weights-first 两阶段调度取代其语义，仅保兼容
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -492,12 +489,16 @@ class MultiStreamStateLoader:
             model_device = next(model.parameters()).device
             if model_device != self.device:
                 self.model.to(self.device)
-        self.load_grad = load_grad
-        self.forward_prefetch_window = max(0, int(forward_prefetch_window))
+        if load_grad:
+            print("[WARN] load_grad is deprecated: v3 checkpoints carry no grad stream "
+                  "(grads are recomputed after resume); ignored.")
+        self.master_applier = master_applier
+        self._master_warned = False
+        if weights_first is None:
+            weights_first = os.environ.get("PIPELAYER_WEIGHTS_FIRST", "0") == "1"
+        self.weights_first = bool(weights_first)
+        self.forward_prefetch_window = int(forward_prefetch_window)
         self.restore_schedule_policy = str(restore_schedule_policy)
-        supported_policies = {"window_interleave", "weights_first", "critical_stream_first"}
-        if self.restore_schedule_policy not in supported_policies:
-            raise ValueError(f"Unsupported restore_schedule_policy={restore_schedule_policy!r}")
         self._fatal_error: Optional[BaseException] = None
 
         metadata_path = metadata_file
@@ -506,12 +507,29 @@ class MultiStreamStateLoader:
         with open(metadata_path, "r", encoding="utf-8") as f:
             self.metadata = json.load(f)
 
-        metadata_num_chunks = int(self.metadata["num_chunks"])
-        self.stream_names: List[str] = list(self.metadata.get("stream_names", ["param", "grad", "exp_avg", "exp_avg_sq"]))
+        # 版本门禁：v3 变更了数据区基址((max_async+4))与量化布局，旧格式本就不可读，
+        # 不保留死代码兼容分支。
+        version = int(self.metadata.get("version", 1))
+        if version < 3:
+            raise ValueError(
+                f"multistream metadata version {version} is not supported by this loader "
+                f"(requires >= 3: interleaved quant layout + extra stream + fixed data base). "
+                f"Re-save the checkpoint with the current CascadeSave.")
+
+        self.num_chunks = int(self.metadata["num_chunks"])
+        self.stream_names: List[str] = list(self.metadata.get("stream_names", ["param", "master", "exp_avg", "exp_avg_sq"]))
         self.stream_sizes: List[int] = [int(x) for x in self.metadata.get("stream_sizes", [])]
         self.max_async = int(self.metadata.get("max_async", 1))
-        self.stream_name_to_idx: Dict[str, int] = {name: idx for idx, name in enumerate(self.stream_names)}
-        self._validate_stream_layout()
+
+        qm = self.metadata.get("quant_moments", {}) or {}
+        self.quant_enabled = bool(qm.get("enabled"))
+        self.quant_block = int(qm.get("block", 0))
+        es = self.metadata.get("extra_state", {}) or {}
+        self.extra_state_enabled = bool(es.get("enabled"))
+        self.extra_stream_id = int(es.get("stream_id", 4))
+        self.extra_stream_floats = int(es.get("floats", 0))
+        # 数据流 = 除 extra 外的流（extra 由 load_extra_state 单独读取）
+        self.data_stream_names = [s for s in self.stream_names if s != "extra"]
 
         if checkpoint_file is None:
             checkpoint_file = self.metadata.get("checkpoint_file")
@@ -525,20 +543,18 @@ class MultiStreamStateLoader:
         self.param_name_to_tensor: Dict[str, nn.Parameter] = {name: p for name, p in self.model.named_parameters()}
         self.buffer_name_to_tensor: Dict[str, torch.Tensor] = {name: b for name, b in self.model.named_buffers()}
 
-        self.layer_group_manifest = self._build_layer_group_manifest(metadata_num_chunks)
-        self.group_idx_to_manifest: Dict[int, _LayerGroupManifest] = {
-            group.group_idx: group for group in self.layer_group_manifest
-        }
-        self.num_chunks = len(self.layer_group_manifest)
-
-        # param_name -> forward/update group idx. Keep the old name for callers.
+        # param_name -> 覆盖它的全部 chunk（split 分组下张量可横跨多组，
+        # forward pre-hook 必须等待全部覆盖 chunk——正确性要求非优化）。
+        # param_name_to_chunk（单值）保留作兼容别名（取最后一个）。
+        self.param_name_to_chunks: Dict[str, set] = {}
         self.param_name_to_chunk: Dict[str, int] = {}
-        self.param_name_to_group = self.param_name_to_chunk
-        for group in self.layer_group_manifest:
-            for pname in group.param_names:
-                if pname in self.param_name_to_chunk:
-                    raise ValueError(f"Duplicate parameter '{pname}' in multistream layer-group metadata.")
-                self.param_name_to_chunk[pname] = int(group.group_idx)
+        for cid, meta in self.metadata.get("chunks", {}).items():
+            ic = int(cid)
+            for pinfo in meta.get("params", []):
+                pname = pinfo.get("name")
+                if pname:
+                    self.param_name_to_chunks.setdefault(pname, set()).add(ic)
+                    self.param_name_to_chunk[pname] = ic
 
         # 异步加载前先校验：避免在 copy worker 里晚失败且错误不直观。
         self._validate_metadata_compatibility()
@@ -546,32 +562,27 @@ class MultiStreamStateLoader:
         # 加载 optimizer param groups（若提供）
         self._load_optimizer_param_groups()
         self.optimizer_steps: Dict[str, int] = self.metadata.get("optimizer_steps", {})
-        
+
         # 验证 optimizer step 一致性，并计算全局 step
+        # （blob 中的 optimizer_step 更可靠，slot 解析后若可读则覆盖此值）
         self.global_optimizer_step: Optional[int] = self._validate_and_get_global_step()
 
+        # master 流非空但未提供 applier：只能跳过（4N 对照档的 grad 流按
+        # param_groups 序排列，与 named_parameters 序不同，不支持按层恢复）。
+        master_idx = self.data_stream_names.index("master") if "master" in self.data_stream_names else -1
+        self._master_stream_floats = self.stream_sizes[master_idx] if master_idx >= 0 else 0
+        if self._master_stream_floats > 0 and self.master_applier is None:
+            print("[WARN] checkpoint has a non-empty master stream but no master_applier "
+                  "was provided; master stream will be skipped during restore.")
+
         if num_copy_workers is None:
-            num_copy_workers = 1
+            # state 已预建（无分配/竞态障碍），2 个 worker 让 H2D 与反量化重叠
+            num_copy_workers = 2
         self.num_copy_workers = int(num_copy_workers)
-        self._required_update_streams = self._build_required_update_streams()
-        self._restore_start_time = time.time()
-        self._stats_lock = threading.Lock()
-        self._restore_stats: Dict[str, Any] = {
-            "forward_wait_s": 0.0,
-            "update_barrier_wait_s": 0.0,
-            "forward_ready_all_s": None,
-            "update_ready_all_s": None,
-            "forward_group_ready_s": {},
-            "update_group_ready_s": {},
-            "forward_group_wait_s": {},
-            "update_group_wait_s": {},
-            "restore_schedule_policy": self.restore_schedule_policy,
-            "forward_prefetch_window": self.forward_prefetch_window,
-            "required_update_streams": list(self._required_update_streams),
-        }
 
         self._init_device_primitives()
         self._init_reader(lib_path)
+        self._init_pinned_pool()
 
         # 优先从 metadata 读取 latest_parall_iter，避免调用可能崩溃的 C++ 接口
         if parall_iter is None:
@@ -584,13 +595,28 @@ class MultiStreamStateLoader:
         self.parall_iter = int(parall_iter)
         print(f"[MultiStreamStateLoader] Using parall_iter={self.parall_iter}")
 
-        self.host_buffer_queue: "queue.PriorityQueue[Any]" = queue.PriorityQueue(maxsize=host_queue_maxsize)
+        # slot 已定 → 先读 extra blob：其中的 optimizer_step 是 finalize 时刻的
+        # 真实值（metadata 的 optimizer_steps 存在"槽号回填"历史 kludge），
+        # 用它修正预建 state 的 step；顺带完成 crc/parall_iter 一致性早失败。
+        self._extra_state_early: Optional[Dict[str, Any]] = None
+        if self.extra_state_enabled:
+            try:
+                self._extra_state_early = self.load_extra_state()
+                blob_step = (self._extra_state_early or {}).get("optimizer_step")
+                if blob_step is not None and float(blob_step) > 0:
+                    self.global_optimizer_step = int(float(blob_step))
+                    print(f"[MultiStreamStateLoader] optimizer step from extra blob: "
+                          f"{self.global_optimizer_step}")
+            except Exception as e:
+                print(f"[WARN] early extra-state read failed: {e}")
+
+        # 预建全部 optimizer state（zeros + step）：copy worker 热路径零分配、
+        # 多 worker 无 dict 竞态、apply 无 dtype/device 分支。
+        self._precreate_optimizer_state()
+
+        self.host_buffer_queue: "queue.Queue[Any]" = queue.Queue(maxsize=host_queue_maxsize)
         self.producer_stop_event = threading.Event()
         self.copy_worker_stop_event = threading.Event()
-        self._state_lock = threading.Lock()
-        self._optimizer_state_lock = threading.Lock()
-        self._restore_tasks = self._build_restore_tasks()
-        self._record_restore_task_stats()
 
         self._producer_thread = threading.Thread(target=self._io_producer_loop, daemon=True)
         self._copy_worker_threads: List[threading.Thread] = []
@@ -610,181 +636,6 @@ class MultiStreamStateLoader:
             raise RuntimeError(
                 f"MultiStreamStateLoader encountered a fatal error: {self._fatal_error}"
             ) from self._fatal_error
-
-    def _validate_stream_layout(self) -> None:
-        if len(set(self.stream_names)) != len(self.stream_names):
-            raise ValueError(f"Multistream metadata contains duplicate stream names: {self.stream_names}")
-
-        if self.stream_sizes and len(self.stream_sizes) != len(self.stream_names):
-            raise ValueError(
-                "Multistream metadata stream_sizes length must match stream_names length: "
-                f"stream_sizes={len(self.stream_sizes)}, stream_names={len(self.stream_names)}"
-            )
-
-        supported_streams = {"param", "grad", "exp_avg", "exp_avg_sq"}
-        unknown_streams = sorted(set(self.stream_names) - supported_streams)
-        if unknown_streams:
-            raise ValueError(
-                "Unsupported multistream checkpoint streams: "
-                f"{unknown_streams}. Supported streams are {sorted(supported_streams)}."
-            )
-
-        required_streams = {"param", "exp_avg", "exp_avg_sq"}
-        if self.load_grad:
-            required_streams.add("grad")
-        missing_streams = sorted(required_streams - set(self.stream_names))
-        if missing_streams:
-            raise ValueError(
-                "Multistream checkpoint is missing required streams: "
-                f"{missing_streams}. stream_names={self.stream_names}"
-            )
-
-    def _build_layer_group_manifest(self, metadata_num_chunks: int) -> List[_LayerGroupManifest]:
-        chunks = self.metadata.get("chunks")
-        if not isinstance(chunks, dict) or not chunks:
-            raise ValueError("Multistream metadata must contain a non-empty 'chunks' object.")
-
-        groups: List[_LayerGroupManifest] = []
-        for raw_chunk_key, chunk_meta in chunks.items():
-            if not isinstance(chunk_meta, dict):
-                raise ValueError(f"Chunk metadata for key {raw_chunk_key!r} must be an object.")
-
-            try:
-                group_idx = int(chunk_meta.get("group_idx", raw_chunk_key))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Invalid group_idx for chunk {raw_chunk_key!r}: {chunk_meta.get('group_idx')!r}") from exc
-
-            params = chunk_meta.get("params", [])
-            if not isinstance(params, list) or not params:
-                raise ValueError(f"Layer group {group_idx} must contain a non-empty params list.")
-
-            stream_slices = chunk_meta.get("stream_slices", {})
-            if not isinstance(stream_slices, dict):
-                raise ValueError(f"Layer group {group_idx} must contain stream_slices metadata.")
-            for stream_name in ("param", "exp_avg", "exp_avg_sq"):
-                slice_info = stream_slices.get(stream_name)
-                if not slice_info or int(slice_info.get("size", 0)) <= 0:
-                    raise ValueError(f"Layer group {group_idx} is missing non-empty {stream_name!r} stream slice.")
-            if self.load_grad:
-                grad_slice = stream_slices.get("grad")
-                if not grad_slice or int(grad_slice.get("size", 0)) <= 0:
-                    raise ValueError("load_grad=True but layer group " f"{group_idx} has no non-empty 'grad' slice.")
-
-            layer_ids = tuple(int(x) for x in chunk_meta.get("layer_ids", []))
-            param_names: List[str] = []
-            for pinfo in params:
-                name = pinfo.get("name") if isinstance(pinfo, dict) else None
-                if not name:
-                    raise ValueError(f"Layer group {group_idx} contains a parameter entry without a name.")
-                param_names.append(str(name))
-
-            forward_anchor = min(layer_ids) if layer_ids else group_idx
-            groups.append(
-                _LayerGroupManifest(
-                    group_idx=group_idx,
-                    chunk_key=str(raw_chunk_key),
-                    forward_order=int(forward_anchor),
-                    layer_ids=layer_ids,
-                    param_names=tuple(param_names),
-                    chunk_meta=chunk_meta,
-                )
-            )
-
-        if len(groups) != metadata_num_chunks:
-            raise ValueError(
-                "Multistream metadata num_chunks does not match chunks entries: "
-                f"num_chunks={metadata_num_chunks}, chunks={len(groups)}"
-            )
-
-        actual_group_ids = {group.group_idx for group in groups}
-        expected_group_ids = set(range(len(groups)))
-        if actual_group_ids != expected_group_ids:
-            raise ValueError(
-                "Multistream layer-group ids must be contiguous from 0 to num_chunks-1. "
-                f"actual={sorted(actual_group_ids)}, expected={sorted(expected_group_ids)}"
-            )
-
-        return sorted(groups, key=lambda group: (group.forward_order, group.group_idx))
-
-    def _build_restore_tasks(self) -> List[_RestoreTask]:
-        tasks: List[_RestoreTask] = []
-        sequence = 0
-        num_groups = len(self.layer_group_manifest)
-
-        def add_weight_task(group: _LayerGroupManifest) -> None:
-            nonlocal sequence
-            tasks.append(
-                _RestoreTask(
-                    priority=sequence,
-                    sequence=sequence,
-                    group_idx=group.group_idx,
-                    phase="weights",
-                    streams=("param",),
-                    chunk_meta=group.chunk_meta,
-                )
-            )
-            sequence += 1
-
-        def add_update_task(group: _LayerGroupManifest, stream_name: str) -> None:
-            nonlocal sequence
-            tasks.append(
-                _RestoreTask(
-                    priority=sequence,
-                    sequence=sequence,
-                    group_idx=group.group_idx,
-                    phase="update",
-                    streams=(stream_name,),
-                    chunk_meta=group.chunk_meta,
-                )
-            )
-            sequence += 1
-
-        if self.restore_schedule_policy in {"weights_first", "critical_stream_first"}:
-            for group in self.layer_group_manifest:
-                add_weight_task(group)
-            for group in self.layer_group_manifest:
-                for stream_name in self._required_update_streams:
-                    add_update_task(group, stream_name)
-            return tasks
-
-        next_weight_idx = 0
-        initial_weight_count = min(num_groups, self.forward_prefetch_window + 1)
-        while next_weight_idx < initial_weight_count:
-            add_weight_task(self.layer_group_manifest[next_weight_idx])
-            next_weight_idx += 1
-
-        for update_group in self.layer_group_manifest:
-            for stream_name in self._required_update_streams:
-                add_update_task(update_group, stream_name)
-                if next_weight_idx < num_groups:
-                    add_weight_task(self.layer_group_manifest[next_weight_idx])
-                    next_weight_idx += 1
-
-        while next_weight_idx < num_groups:
-            add_weight_task(self.layer_group_manifest[next_weight_idx])
-            next_weight_idx += 1
-
-        return tasks
-
-    def _record_restore_task_stats(self) -> None:
-        order = [
-            {
-                "sequence": int(task.sequence),
-                "phase": task.phase,
-                "group_idx": int(task.group_idx),
-                "streams": list(task.streams),
-            }
-            for task in self._restore_tasks
-        ]
-        with self._stats_lock:
-            self._restore_stats["num_restore_tasks"] = len(order)
-            self._restore_stats["restore_task_order"] = order
-
-    def _build_required_update_streams(self) -> Tuple[str, ...]:
-        streams = ["exp_avg", "exp_avg_sq"]
-        if self.load_grad:
-            streams.append("grad")
-        return tuple(streams)
 
     def _validate_metadata_compatibility(self) -> None:
         """校验 metadata 中参数与当前模型参数的可兼容性（按 name + numel）。"""
@@ -849,46 +700,89 @@ class MultiStreamStateLoader:
                 raise RuntimeError("Failed to initialize streams in multistream reader")
 
     def _init_device_primitives(self) -> None:
-        self._forward_ready_flags = [False for _ in range(self.num_chunks)]
-        self._update_ready_flags = [False for _ in range(self.num_chunks)]
-        self._update_stream_ready_flags = [
-            {stream_name: False for stream_name in self._required_update_streams}
-            for _ in range(self.num_chunks)
-        ]
-        self._chunk_loaded_flags = self._update_ready_flags
+        n = self.num_chunks
+        # 两级就绪：param（forward 可跑）与 full（optimizer 状态齐）。
+        # weights-first 关闭时二者在同一 phase 一起置位。
+        self._chunk_param_loaded = [False] * n
+        self._chunk_full_loaded = [False] * n
+        # CPU 侧就绪信号：wait_for_chunk* 先等它再做 GPU 侧 wait_event——
+        # 未 record 的 CUDA event 上 wait_event 是空操作，原实现存在
+        # "hook 先于 worker 记录事件" 的潜伏时序漏洞，这里补上。
+        self._param_done_cpu = [threading.Event() for _ in range(n)]
+        self._full_done_cpu = [threading.Event() for _ in range(n)]
+        self._param_ready_time: Dict[int, float] = {}
+        self._full_ready_time: Dict[int, float] = {}
+        self._loader_init_time = time.time()
         if self.device.type == "cuda":
             with torch.cuda.device(self.device):
-                low_priority = 0
-                high_priority = 0
-                try:
-                    low_priority, high_priority = torch.cuda.get_stream_priority_range()
-                except Exception:
-                    pass
-                self.weight_copy_streams = [
-                    torch.cuda.Stream(priority=high_priority) for _ in range(self.num_copy_workers)
-                ]
-                self.update_copy_streams = [
-                    torch.cuda.Stream(priority=low_priority) for _ in range(self.num_copy_workers)
-                ]
-                self.copy_streams = self.weight_copy_streams
-                self.forward_events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_chunks)]
-                self.update_stream_events = [
-                    {stream_name: torch.cuda.Event(enable_timing=False) for stream_name in self._required_update_streams}
-                    for _ in range(self.num_chunks)
-                ]
-                self.update_events = self.update_stream_events
-                self.events = self.update_events
+                self.copy_streams = [torch.cuda.Stream() for _ in range(self.num_copy_workers)]
+                self.param_events = [torch.cuda.Event(enable_timing=False) for _ in range(n)]
+                self.full_events = [torch.cuda.Event(enable_timing=False) for _ in range(n)]
         else:
-            self.weight_copy_streams = [None for _ in range(self.num_copy_workers)]
-            self.update_copy_streams = [None for _ in range(self.num_copy_workers)]
-            self.copy_streams = self.weight_copy_streams
-            self.forward_events = [threading.Event() for _ in range(self.num_chunks)]
-            self.update_stream_events = [
-                {stream_name: threading.Event() for stream_name in self._required_update_streams}
-                for _ in range(self.num_chunks)
-            ]
-            self.update_events = self.update_stream_events
-            self.events = self.update_events
+            self.copy_streams = [None for _ in range(self.num_copy_workers)]
+            self.param_events = self._param_done_cpu
+            self.full_events = self._full_done_cpu
+        # 兼容旧属性名
+        self.events = self.param_events
+        self._chunk_loaded_flags = self._chunk_param_loaded
+
+    def _precreate_optimizer_state(self) -> None:
+        """为全部待恢复参数预建 exp_avg/exp_avg_sq（零张量）与 step。
+
+        copy worker 热路径因此零分配、零 dict 竞态；apply 只做原位片段填充
+        （split 分组下同一参数的不同 piece 可能由不同 worker 并发写入，
+        预建后各写各的 disjoint 区间，天然无竞态）。
+        """
+        step_value = float(self.global_optimizer_step) if self.global_optimizer_step else 1.0
+        if step_value <= 0:
+            step_value = 1.0
+        with torch.no_grad():
+            for name, param in self.param_name_to_tensor.items():
+                if name not in self.param_name_to_chunks:
+                    continue
+                state = self.optimizer.state.setdefault(param, {})
+                if not isinstance(state.get("exp_avg"), torch.Tensor):
+                    state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                if not isinstance(state.get("exp_avg_sq"), torch.Tensor):
+                    state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                # AdamW foreach 要求 step 为 CPU float tensor
+                state["step"] = torch.tensor(step_value, dtype=torch.float32, device="cpu")
+
+    def _init_pinned_pool(self) -> None:
+        """按"各数据流最大 chunk span"预分配 pinned buffer 池。
+
+        替代热路径逐 chunk torch.empty(pin_memory=True)（cudaHostAlloc 串行化，
+        已诊断瓶颈）；池深有限 ⇒ 对 producer 形成天然背压，读盘不会无界超前。
+        """
+        per_stream = max(1, int(os.environ.get("PIPELAYER_PIN_BUFFERS_PER_STREAM", "2")))
+        max_span: Dict[str, int] = {}
+        for chunk in self.metadata.get("chunks", {}).values():
+            for sname, sl in chunk.get("stream_slices", {}).items():
+                max_span[sname] = max(max_span.get(sname, 0), int(sl.get("size", 0)))
+        pin = self.device.type == "cuda"
+        self._pinned_pool: Dict[str, "queue.Queue[torch.Tensor]"] = {}
+        total_bytes = 0
+        for sname, span in max_span.items():
+            if span <= 0:
+                continue
+            if sname == "master" and self.master_applier is None:
+                continue  # 不消费的流不占 pinned 内存
+            pool: "queue.Queue[torch.Tensor]" = queue.Queue()
+            for _ in range(per_stream):
+                pool.put(torch.empty(span, dtype=torch.float32, pin_memory=pin))
+                total_bytes += span * 4
+            self._pinned_pool[sname] = pool
+        sizes_desc = {k: f"{per_stream}x{max_span[k] * 4 / 1e6:.0f}MB" for k in self._pinned_pool}
+        print(f"[MultiStreamStateLoader] pinned pool: {sizes_desc} total {total_bytes / 1e9:.2f} GB")
+
+    def _pool_get(self, stream_name: str) -> torch.Tensor:
+        pool = self._pinned_pool[stream_name]
+        while True:
+            try:
+                return pool.get(timeout=0.2)
+            except queue.Empty:
+                if self.producer_stop_event.is_set():
+                    raise RuntimeError("producer stopped while waiting for pinned buffer")
 
     def _load_optimizer_param_groups(self) -> None:
         groups = self.metadata.get("optimizer_param_groups")
@@ -906,7 +800,7 @@ class MultiStreamStateLoader:
                 new_param_groups.append(new_group)
         if new_param_groups:
             self.optimizer.param_groups = new_param_groups
-            self.optimizer.state = defaultdict(dict)
+            self.optimizer.state = {}
 
     def _validate_and_get_global_step(self) -> Optional[int]:
         """
@@ -937,322 +831,266 @@ class MultiStreamStateLoader:
         )
         return 1
 
-    def _add_restore_stat(self, key: str, value: float) -> None:
-        with self._stats_lock:
-            current = self._restore_stats.get(key, 0.0)
-            self._restore_stats[key] = float(current) + float(value)
+    # phase → 本阶段要读的数据流。weights-first：先全组 param（forward 起跑），
+    # 再回头补 master+moments（首个 optimizer.step 前由 wait_all_full 兜底）。
+    _PHASE_STREAMS = {
+        "param": ("param",),
+        "opt": ("master", "exp_avg", "exp_avg_sq"),
+        "full": ("param", "master", "exp_avg", "exp_avg_sq"),
+    }
 
-    def _add_group_restore_stat(self, key: str, group_idx: int, value: float) -> None:
-        with self._stats_lock:
-            group_stats = self._restore_stats.setdefault(key, {})
-            current = group_stats.get(group_idx, 0.0)
-            group_stats[group_idx] = float(current) + float(value)
+    def _read_chunk_streams(self, chunk_meta: Dict[str, Any], phase: str) -> Dict[str, Tuple[torch.Tensor, int]]:
+        """把本 chunk 指定 phase 的各流 span 从 mmap 读入池化 pinned buffer。
 
-    def _mark_forward_group_ready(self, group_idx: int) -> None:
-        elapsed = time.time() - self._restore_start_time
-        with self._state_lock:
-            self._forward_ready_flags[group_idx] = True
-            with self._stats_lock:
-                self._restore_stats["forward_group_ready_s"][group_idx] = elapsed
-                if self._restore_stats["forward_ready_all_s"] is None and all(self._forward_ready_flags):
-                    self._restore_stats["forward_ready_all_s"] = elapsed
-
-    def _mark_update_stream_ready(self, group_idx: int, stream_name: str) -> None:
-        elapsed = time.time() - self._restore_start_time
-        with self._state_lock:
-            self._update_stream_ready_flags[group_idx][stream_name] = True
-            group_ready = all(self._update_stream_ready_flags[group_idx].values())
-            if group_ready:
-                self._update_ready_flags[group_idx] = True
-            with self._stats_lock:
-                if group_ready:
-                    self._restore_stats["update_group_ready_s"][group_idx] = elapsed
-                    if self._restore_stats["update_ready_all_s"] is None and all(self._update_ready_flags):
-                        self._restore_stats["update_ready_all_s"] = elapsed
-
-    def get_restore_stats(self) -> Dict[str, Any]:
-        with self._stats_lock:
-            stats = dict(self._restore_stats)
-            stats["forward_group_ready_s"] = dict(self._restore_stats["forward_group_ready_s"])
-            stats["update_group_ready_s"] = dict(self._restore_stats["update_group_ready_s"])
-            stats["forward_group_wait_s"] = dict(self._restore_stats.get("forward_group_wait_s", {}))
-            stats["update_group_wait_s"] = dict(self._restore_stats.get("update_group_wait_s", {}))
-            stats["required_update_streams"] = list(self._restore_stats.get("required_update_streams", []))
-            stats["restore_task_order"] = list(self._restore_stats.get("restore_task_order", []))
-            return stats
+        Returns: {stream_name: (pooled_buffer, used_floats)}
+        """
+        out: Dict[str, Tuple[torch.Tensor, int]] = {}
+        for stream_name in self._PHASE_STREAMS[phase]:
+            if stream_name not in self._pinned_pool:
+                continue  # 空流（如 fp32 下 master）或无 applier 的 master
+            slice_info = chunk_meta.get("stream_slices", {}).get(stream_name)
+            if not slice_info or int(slice_info.get("size", 0)) == 0:
+                continue
+            size = int(slice_info["size"])
+            offset = int(slice_info["offset"])
+            buf = self._pool_get(stream_name)
+            assert size <= buf.numel(), (
+                f"stream {stream_name} slice {size} exceeds pool buffer {buf.numel()}")
+            reader_obj = self.reader_obj
+            if reader_obj is None:
+                raise RuntimeError("reader_obj is None while producer is still running")
+            self.lib.read_stream_chunk(
+                reader_obj,
+                int(self.stream_names.index(stream_name)),
+                c_void_p(buf.data_ptr()),
+                c_size_t(offset),
+                c_size_t(size),
+                c_int(self.parall_iter),
+            )
+            out[stream_name] = (buf, size)
+        return out
 
     def _io_producer_loop(self) -> None:
         try:
-            for task in self._restore_tasks:
-                if self.producer_stop_event.is_set():
-                    break
-                buffers: Dict[str, torch.Tensor] = {}
-                for stream_name in task.streams:
+            phases = ("param", "opt") if self.weights_first else ("full",)
+            for phase in phases:
+                for i in range(self.num_chunks):
                     if self.producer_stop_event.is_set():
-                        break
-                    slice_info = task.chunk_meta.get("stream_slices", {}).get(stream_name)
-                    if not slice_info:
-                        raise ValueError(
-                            f"Layer group {task.group_idx} is missing required stream slice {stream_name!r}."
-                        )
-                    size = int(slice_info.get("size", 0))
-                    if size == 0:
-                        continue
-                    offset = int(slice_info["offset"])
-                    buffer = torch.empty(size, dtype=torch.float32, pin_memory=self.device.type == "cuda")
-                    reader_obj = self.reader_obj
-                    if reader_obj is None:
-                        raise RuntimeError("reader_obj is None while producer is still running")
-                    stream_idx = self.stream_name_to_idx[stream_name]
-                    self.lib.read_stream_chunk(
-                        reader_obj,
-                        int(stream_idx),
-                        c_void_p(buffer.data_ptr()),
-                        c_size_t(offset),
-                        c_size_t(size),
-                        c_int(self.parall_iter),
-                    )
-                    buffers[stream_name] = buffer
-
-                if self.producer_stop_event.is_set():
-                    break
-                self.host_buffer_queue.put(
-                    _BufferedRestoreTask(
-                        priority=task.priority,
-                        sequence=task.sequence,
-                        group_idx=task.group_idx,
-                        phase=task.phase,
-                        streams=task.streams,
-                        buffers=buffers,
-                        chunk_meta=task.chunk_meta,
-                    )
-                )
+                        return
+                    chunk_meta = self.metadata["chunks"][str(i)]
+                    buffers = self._read_chunk_streams(chunk_meta, phase)
+                    self.host_buffer_queue.put((i, phase, buffers, chunk_meta))
         except Exception as e:
+            if self.producer_stop_event.is_set():
+                return  # 正常 stop 流程中被打断（如 _pool_get 退出），非错误
             print(f"[ERROR] MultiStream producer error: {e}")
             self._set_fatal_error(e)
             self.producer_stop_event.set()
-            self.copy_worker_stop_event.set()
-        finally:
-            for i in range(self.num_copy_workers):
-                self.host_buffer_queue.put(
-                    _BufferedRestoreTask(
-                        priority=10_000_000,
-                        sequence=10_000_000 + i,
-                        group_idx=-1,
-                        phase="stop",
-                        streams=(),
-                        buffers={},
-                        chunk_meta={},
-                    )
-                )
 
     def _copy_worker_loop(self, worker_idx: int) -> None:
+        stream = self.copy_streams[worker_idx]
         try:
             if self.device.type == "cuda":
                 with torch.cuda.device(self.device):
-                    self._copy_worker_loop_impl(worker_idx)
+                    self._copy_worker_loop_impl(worker_idx, stream)  # type: ignore[arg-type]
             else:
-                self._copy_worker_loop_impl(worker_idx)
+                self._copy_worker_loop_impl(worker_idx, stream=None)
         except Exception as e:
             print(f"[ERROR] MultiStream copy worker error (idx={worker_idx}): {e}")
             self._set_fatal_error(e)
-            self.producer_stop_event.set()
             self.copy_worker_stop_event.set()
 
-    def _copy_worker_loop_impl(self, worker_idx: int) -> None:
-        while True:
-            if self.copy_worker_stop_event.is_set() and self.host_buffer_queue.empty():
-                break
+    def _copy_worker_loop_impl(self, worker_idx: int, stream: Optional["torch.cuda.Stream"]) -> None:  # type: ignore[name-defined]
+        while not (self.copy_worker_stop_event.is_set() and self.host_buffer_queue.empty()):
             try:
                 item = self.host_buffer_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
-            if item.phase == "stop":
+            if item is None:
                 self.host_buffer_queue.task_done()
                 break
-            task = item
+            chunk_idx, phase, buffers, chunk_meta = item
             try:
+                views = {k: b[:sz] for k, (b, sz) in buffers.items()}
                 if self.device.type == "cuda":
-                    stream = (
-                        self.update_copy_streams[worker_idx]
-                        if task.phase == "update"
-                        else self.weight_copy_streams[worker_idx]
-                    )
                     assert stream is not None
                     with torch.cuda.stream(stream):
-                        self._apply_buffered_restore_task(task)
-                        if task.phase == "weights":
-                            self.forward_events[task.group_idx].record(stream)  # type: ignore[union-attr]
-                        elif task.phase == "update":
-                            for stream_name in task.streams:
-                                self.update_stream_events[task.group_idx][stream_name].record(stream)  # type: ignore[union-attr]
-                        else:
-                            raise ValueError(f"Unknown restore task phase: {task.phase!r}")
-                    if task.phase == "weights":
-                        self._mark_forward_group_ready(task.group_idx)
-                    elif task.phase == "update":
-                        for stream_name in task.streams:
-                            self._mark_update_stream_ready(task.group_idx, stream_name)
+                        self._apply_multistream_chunk(views, chunk_meta, phase)
+                        if phase in ("param", "full"):
+                            self.param_events[chunk_idx].record(stream)  # type: ignore[union-attr]
+                        if phase in ("opt", "full"):
+                            self.full_events[chunk_idx].record(stream)  # type: ignore[union-attr]
+                    # 归还 pinned buffer 前必须确认本 stream 上的 H2D 已完成；
+                    # 顺带保证置位 CPU 就绪信号时 CUDA event 必已 record+complete
+                    stream.synchronize()
                 else:
-                    self._apply_buffered_restore_task(task)
-                    if task.phase == "weights":
-                        self.forward_events[task.group_idx].set()  # type: ignore[union-attr]
-                        self._mark_forward_group_ready(task.group_idx)
-                    elif task.phase == "update":
-                        for stream_name in task.streams:
-                            self.update_stream_events[task.group_idx][stream_name].set()  # type: ignore[union-attr]
-                            self._mark_update_stream_ready(task.group_idx, stream_name)
-                    else:
-                        raise ValueError(f"Unknown restore task phase: {task.phase!r}")
+                    self._apply_multistream_chunk(views, chunk_meta, phase)
+                self._mark_phase_done(chunk_idx, phase)
             finally:
+                for k, (b, _) in buffers.items():
+                    self._pinned_pool[k].put(b)
                 self.host_buffer_queue.task_done()
 
-    def _apply_buffered_restore_task(self, task: _BufferedRestoreTask) -> None:
-        if task.phase == "weights":
-            self._apply_weight_stream(task.buffers, task.chunk_meta)
-        elif task.phase == "update":
-            self._apply_update_streams(task.buffers, task.chunk_meta)
-        else:
-            raise ValueError(f"Unknown restore task phase: {task.phase!r}")
+    def _mark_phase_done(self, chunk_idx: int, phase: str) -> None:
+        now = time.time() - self._loader_init_time
+        if phase in ("param", "full"):
+            self._chunk_param_loaded[chunk_idx] = True
+            self._param_ready_time.setdefault(chunk_idx, now)
+            self._param_done_cpu[chunk_idx].set()
+        if phase in ("opt", "full"):
+            self._chunk_full_loaded[chunk_idx] = True
+            self._full_ready_time.setdefault(chunk_idx, now)
+            self._full_done_cpu[chunk_idx].set()
 
-    def _apply_weight_stream(self, buffers: Dict[str, torch.Tensor], chunk_meta: Dict[str, Any]) -> None:
-        for pinfo in chunk_meta.get("params", []):
-            name = pinfo.get("name")
-            if not name or name not in self.param_name_to_tensor:
-                continue
-            param = self.param_name_to_tensor[name]
-            numel = int(pinfo.get("numel", param.numel()))
-            if numel != int(param.numel()):
-                raise ValueError(
-                    f"Parameter numel mismatch for '{name}': ckpt={numel}, model={param.numel()}, "
-                    f"model_shape={tuple(param.shape)}"
-                )
-            offsets = pinfo.get("offsets_in_chunk", {})
-            dtype = param.dtype
-            non_blocking = self.device.type == "cuda"
+    def _apply_multistream_chunk(self, buffers: Dict[str, torch.Tensor],
+                                 chunk_meta: Dict[str, Any], phase: str = "full") -> None:
+        """piece 粒度 apply：本 chunk 的每个 pinfo 只覆盖 elem_range=[ps,pe)。
 
-            if "param" not in buffers or "param" not in offsets:
-                raise ValueError(f"Layer group is missing param data for '{name}'.")
-            host_view = self._host_view_for_param(buffers, offsets, "param", name, numel, param.shape)
-            param.data.copy_(host_view.to(self.device, dtype=dtype, non_blocking=non_blocking))
+        param/moment 一律经 flat 视图片段原位写入（pinned→device 单跳直拷，
+        不再经 .to(device) 临时张量）；量化 moment 走 GPU 反量化；master 流
+        交给 master_applier 钩子。step/param_groups 已在 __init__ 预建，
+        不在热路径处理。split 分组下同一参数的不同 piece 可能由不同 worker
+        并发写入 disjoint 区间，预建 state 后天然无竞态。
+        """
+        non_blocking = self.device.type == "cuda"
+        with torch.no_grad():
+            for pinfo in chunk_meta.get("params", []):
+                name = pinfo.get("name")
+                if not name or name not in self.param_name_to_tensor:
+                    continue
+                param = self.param_name_to_tensor[name]
+                numel = int(pinfo.get("numel", param.numel()))
+                if numel != int(param.numel()):
+                    raise ValueError(
+                        f"Parameter numel mismatch for '{name}': ckpt={numel}, "
+                        f"model={param.numel()}, model_shape={tuple(param.shape)}")
+                ps, pe = [int(x) for x in pinfo.get("elem_range", (0, numel))]
+                offsets = pinfo.get("offsets_in_chunk", {})
+                sizes = pinfo.get("sizes", {})
+                seg = pe - ps
+                if seg <= 0:
+                    continue
 
-    def _apply_update_streams(self, buffers: Dict[str, torch.Tensor], chunk_meta: Dict[str, Any]) -> None:
-        restore_streams = tuple(buffers.keys())
-        for pinfo in chunk_meta.get("params", []):
-            name = pinfo.get("name")
-            if not name or name not in self.param_name_to_tensor:
-                continue
-            param = self.param_name_to_tensor[name]
-            numel = int(pinfo.get("numel", param.numel()))
-            if numel != int(param.numel()):
-                raise ValueError(
-                    f"Parameter numel mismatch for '{name}': ckpt={numel}, model={param.numel()}, "
-                    f"model_shape={tuple(param.shape)}"
-                )
-            offsets = pinfo.get("offsets_in_chunk", {})
-            dtype = param.dtype
-            non_blocking = self.device.type == "cuda"
+                if phase in ("param", "full") and "param" in buffers:
+                    start = int(offsets["param"])
+                    src = buffers["param"][start:start + seg]
+                    if int(src.numel()) != seg:
+                        raise ValueError(
+                            f"param slice out-of-range for '{name}': "
+                            f"[{start}:{start + seg}] in {buffers['param'].numel()}")
+                    param.data.view(-1)[ps:pe].copy_(src, non_blocking=non_blocking)
 
-            if "grad" in restore_streams:
-                if "grad" not in buffers or "grad" not in offsets:
-                    raise ValueError(f"load_grad=True but checkpoint grad data is missing for '{name}'.")
-                host_view = self._host_view_for_param(buffers, offsets, "grad", name, numel, param.shape)
-                if param.grad is None:
-                    param.grad = torch.zeros_like(param)
-                param.grad.data.copy_(host_view.to(self.device, dtype=dtype, non_blocking=non_blocking))
+                if phase not in ("opt", "full"):
+                    continue
 
-            with self._optimizer_state_lock:
-                state = self.optimizer.state.setdefault(param, {})
-            for state_name in ("exp_avg", "exp_avg_sq"):
-                if state_name in restore_streams:
-                    self._restore_optimizer_tensor_state(
-                        state, buffers, offsets, state_name, name, numel, param.shape, dtype
-                    )
-            self._restore_optimizer_step(state, name)
+                if ("master" in buffers and int(sizes.get("master", 0)) > 0
+                        and self.master_applier is not None):
+                    start = int(offsets["master"])
+                    src = buffers["master"][start:start + seg]
+                    self.master_applier(param, src, ps, pe)
 
-    def _host_view_for_param(
-        self,
-        buffers: Dict[str, torch.Tensor],
-        offsets: Dict[str, Any],
-        stream_name: str,
-        param_name: str,
-        numel: int,
-        shape: torch.Size,
-    ) -> torch.Tensor:
-        start = int(offsets[stream_name])
-        host_slice = buffers[stream_name][start:start + numel]
-        if int(host_slice.numel()) != numel:
+                state = self.optimizer.state[param]
+                q = pinfo.get("quant")
+                for skey, sqrt_domain in (("exp_avg", False), ("exp_avg_sq", True)):
+                    if skey not in buffers:
+                        continue
+                    start = int(offsets[skey])
+                    dst = state[skey].view(-1)[ps:pe]
+                    if q:
+                        fsz = int(sizes[skey])
+                        src = buffers[skey][start:start + fsz]
+                        self._dequant_piece_into(dst, src, q, ps, pe, sqrt_domain)
+                    else:
+                        src = buffers[skey][start:start + seg]
+                        if int(src.numel()) != seg:
+                            raise ValueError(
+                                f"{skey} slice out-of-range for '{name}': "
+                                f"[{start}:{start + seg}] in {buffers[skey].numel()}")
+                        dst.copy_(src, non_blocking=non_blocking)
+
+    def _dequant_piece_into(self, dst_flat: torch.Tensor, src_region: torch.Tensor,
+                            quant_meta: Dict[str, Any], ps: int, pe: int,
+                            sqrt_domain: bool) -> None:
+        """v3 交错单元反量化：src_region 为若干单元 [int8*B | fp32 scale] 顺排。
+
+        与保存侧 _pack_moment_int8 严格互逆：block 是张量内局部坐标、切口
+        block 对齐 ⇒ 分段反量化与整张量反量化逐位一致。packed 字节直接 H2D
+        后在 GPU 上解交错+反量化（moment 流传输量为 fp32 的 ~1/4）。
+        """
+        fmt = quant_meta.get("format")
+        if fmt != "interleaved-block":
+            raise ValueError(f"unsupported quant format {fmt!r} "
+                             f"(this loader supports 'interleaved-block' only)")
+        block = int(quant_meta["block"])
+        unit = block // 4 + 1
+        n = int(quant_meta["numel"])
+        assert ps % block == 0 and (pe == n or pe % block == 0), (
+            f"quant piece [{ps},{pe}) not aligned to block {block} (numel={n})")
+        nb_piece = (pe + block - 1) // block - ps // block
+        expected = nb_piece * unit
+        if int(src_region.numel()) != expected:
+            raise ValueError(f"quant region size {src_region.numel()} != expected {expected}")
+        region = src_region.to(self.device, non_blocking=self.device.type == "cuda")
+        region = region.view(nb_piece, unit)
+        payload = region[:, :unit - 1].contiguous().view(torch.int8).view(nb_piece, block).float()
+        scale = region[:, unit - 1].unsqueeze(1)
+        deq = (payload * scale).view(-1)[: pe - ps]
+        if sqrt_domain:
+            deq = deq.square()  # 保存端在 sqrt 域量化，恢复端平方还原
+        dst_flat.copy_(deq)
+
+    # ================== 非分层状态（extra state, CSXS blob） ==================
+    def load_extra_state(self) -> Optional[Dict[str, Any]]:
+        """读取并校验本 slot 的非分层状态 blob（RNG/scheduler/scaler/用户状态）。
+
+        校验链：magic → 长度 → crc32（parse_extra_state_blob 内）→
+        blob.parall_iter == 本 loader 的 slot（不匹配说明 slot 已被更新的
+        checkpoint 复用，metadata 过期）。
+        """
+        if not self.extra_state_enabled or self.extra_stream_floats <= 0:
+            return None
+        buf = torch.empty(self.extra_stream_floats, dtype=torch.float32)
+        self.lib.read_stream_chunk(
+            self.reader_obj, int(self.extra_stream_id), c_void_p(buf.data_ptr()),
+            c_size_t(0), c_size_t(self.extra_stream_floats), c_int(self.parall_iter))
+        raw = buf.numpy().tobytes()
+        ms = _ms_format()
+        state, _ = ms.MultiStreamCheckpoint.parse_extra_state_blob(raw)
+        blob_slot = int(state.get("parall_iter", -1))
+        if blob_slot != int(self.parall_iter):
             raise ValueError(
-                f"{stream_name} slice out-of-range for '{param_name}': requested [{start}:{start + numel}], "
-                f"available={buffers[stream_name].numel()}"
-            )
-        return host_slice.view(shape)
+                f"extra-state blob parall_iter={blob_slot} != loader slot "
+                f"{self.parall_iter}; slot may have been reused by a newer "
+                f"checkpoint (stale latest_parall_iter in metadata?)")
+        return state
 
-    def _restore_optimizer_tensor_state(
-        self,
-        state: Dict[str, Any],
-        buffers: Dict[str, torch.Tensor],
-        offsets: Dict[str, Any],
-        state_name: str,
-        param_name: str,
-        numel: int,
-        shape: torch.Size,
-        dtype: torch.dtype,
-    ) -> None:
-        if state_name not in buffers or state_name not in offsets:
-            raise ValueError(f"Checkpoint optimizer state {state_name!r} is missing for '{param_name}'.")
-        host_view = self._host_view_for_param(buffers, offsets, state_name, param_name, numel, shape)
-        desired = host_view.to(self.device, dtype=dtype, non_blocking=self.device.type == "cuda")
-        with self._optimizer_state_lock:
-            existing = state.get(state_name)
-            if (
-                isinstance(existing, torch.Tensor)
-                and existing.shape == desired.shape
-                and existing.device == desired.device
-                and existing.dtype == desired.dtype
-            ):
-                existing.data.copy_(desired)
-                state[state_name] = existing
-            else:
-                state[state_name] = desired
-
-    def _restore_optimizer_step(self, state: Dict[str, Any], param_name: str) -> None:
-        step_value = None
-        if self.global_optimizer_step is not None:
-            step_value = float(self.global_optimizer_step)
-        elif param_name in self.optimizer_steps:
-            step_value = float(self.optimizer_steps[param_name])
-        if step_value is None:
-            return
-        if step_value <= 0:
-            fallback = float(int(self.metadata.get("latest_parall_iter", 0)))
-            step_value = fallback if fallback > 0 else 1.0
-        with self._optimizer_state_lock:
-            existing_step = state.get("step")
-            if isinstance(existing_step, torch.Tensor):
-                step_dtype = existing_step.dtype if existing_step.dtype in (torch.float32, torch.float64) else torch.float32
-                step_device = existing_step.device if existing_step.device.type == "cpu" else torch.device("cpu")
-                existing_step.data.copy_(torch.tensor(step_value, dtype=step_dtype, device=step_device))
-                state["step"] = existing_step
-            else:
-                state["step"] = torch.tensor(step_value, dtype=torch.float32, device="cpu")
+    @staticmethod
+    def apply_extra_state(state: Dict[str, Any], scheduler=None, scaler=None,
+                          set_rng: bool = True) -> Optional[Dict[str, Any]]:
+        """应用非分层状态；返回应用自定义的 user dict（如 dataloader 位置）。"""
+        rng = state.get("rng") or {}
+        if set_rng and rng:
+            if rng.get("torch_cpu") is not None:
+                torch.set_rng_state(rng["torch_cpu"])
+            cuda_states = rng.get("torch_cuda")
+            if cuda_states and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(cuda_states)
+            if rng.get("numpy") is not None:
+                np.random.set_state(rng["numpy"])
+            if rng.get("python") is not None:
+                random.setstate(rng["python"])
+        if scheduler is not None and "lr_scheduler" in state:
+            scheduler.load_state_dict(state["lr_scheduler"])
+        if scaler is not None and "grad_scaler" in state:
+            scaler.load_state_dict(state["grad_scaler"])
+        return state.get("user")
 
     def stop(self) -> None:
         self.producer_stop_event.set()
         self.copy_worker_stop_event.set()
-        for i in range(self.num_copy_workers + 2):
+        for _ in range(self.num_copy_workers + 2):
             try:
-                self.host_buffer_queue.put_nowait(
-                    _BufferedRestoreTask(
-                        priority=10_000_000,
-                        sequence=20_000_000 + i,
-                        group_idx=-1,
-                        phase="stop",
-                        streams=(),
-                        buffers={},
-                        chunk_meta={},
-                    )
-                )
+                self.host_buffer_queue.put_nowait(None)
             except queue.Full:
                 break
 
@@ -1293,103 +1131,77 @@ class MultiStreamStateLoader:
             except queue.Empty:
                 break
 
-    def _validate_group_idx(self, group_idx: int) -> None:
-        if not 0 <= group_idx < self.num_chunks:
-            raise IndexError(f"Layer group index out of range: {group_idx}")
-
-    def _wait_until_event_recorded(self, flags: List[bool], group_idx: int) -> None:
-        self._validate_group_idx(group_idx)
-        while not flags[group_idx]:
-            self._raise_if_fatal_error()
-            time.sleep(0.001)
+    def _wait_phase(self, chunk_idx: int, cpu_events, gpu_events) -> None:
         self._raise_if_fatal_error()
-
-    def _wait_for_group_event(self, events: List[Any], flags: List[bool], group_idx: int) -> None:
-        self._raise_if_fatal_error()
-        self._validate_group_idx(group_idx)
-        if self.device.type == "cuda":
-            self._wait_until_event_recorded(flags, group_idx)
-            with torch.cuda.device(self.device):
-                torch.cuda.current_stream().wait_event(events[group_idx])  # type: ignore[arg-type]
-        else:
-            while not events[group_idx].wait(timeout=0.05):  # type: ignore[union-attr]
+        if 0 <= chunk_idx < self.num_chunks:
+            # 先等 CPU 侧就绪信号（保证 CUDA event 已 record——未 record 的
+            # event 上 wait_event 是空操作），再做 GPU 侧顺序约束。
+            while not cpu_events[chunk_idx].wait(timeout=1.0):
                 self._raise_if_fatal_error()
+            if self.device.type == "cuda":
+                with torch.cuda.device(self.device):
+                    torch.cuda.current_stream().wait_event(gpu_events[chunk_idx])  # type: ignore[arg-type]
         self._raise_if_fatal_error()
-
-    def _is_group_event_ready(self, events: List[Any], flags: List[bool], group_idx: int) -> bool:
-        self._raise_if_fatal_error()
-        self._validate_group_idx(group_idx)
-        if self.device.type == "cuda":
-            return bool(flags[group_idx]) and bool(events[group_idx].query())  # type: ignore[union-attr]
-        return bool(flags[group_idx]) and bool(events[group_idx].is_set())  # type: ignore[union-attr]
-
-    def wait_for_forward_group(self, group_idx: int) -> None:
-        t0 = time.time()
-        self._wait_for_group_event(self.forward_events, self._forward_ready_flags, group_idx)
-        elapsed = time.time() - t0
-        self._add_restore_stat("forward_wait_s", elapsed)
-        self._add_group_restore_stat("forward_group_wait_s", group_idx, elapsed)
-
-    def is_forward_group_ready(self, group_idx: int) -> bool:
-        return self._is_group_event_ready(self.forward_events, self._forward_ready_flags, group_idx)
-
-    def wait_for_update_group(self, group_idx: int) -> None:
-        t0 = time.time()
-        self._raise_if_fatal_error()
-        self._validate_group_idx(group_idx)
-        if self.device.type == "cuda":
-            self._wait_until_event_recorded(self._update_ready_flags, group_idx)
-            with torch.cuda.device(self.device):
-                for stream_name in self._required_update_streams:
-                    torch.cuda.current_stream().wait_event(  # type: ignore[arg-type]
-                        self.update_stream_events[group_idx][stream_name]
-                    )
-        else:
-            for stream_name in self._required_update_streams:
-                event = self.update_stream_events[group_idx][stream_name]
-                while not event.wait(timeout=0.05):  # type: ignore[union-attr]
-                    self._raise_if_fatal_error()
-        self._raise_if_fatal_error()
-        self._add_group_restore_stat("update_group_wait_s", group_idx, time.time() - t0)
-
-    def is_update_group_ready(self, group_idx: int) -> bool:
-        self._raise_if_fatal_error()
-        self._validate_group_idx(group_idx)
-        if not self._update_ready_flags[group_idx]:
-            return False
-        if self.device.type == "cuda":
-            return all(
-                bool(self.update_stream_events[group_idx][stream_name].query())  # type: ignore[union-attr]
-                for stream_name in self._required_update_streams
-            )
-        return all(
-            bool(self.update_stream_events[group_idx][stream_name].is_set())  # type: ignore[union-attr]
-            for stream_name in self._required_update_streams
-        )
-
-    def wait_forward_ready(self) -> None:
-        for group_idx in range(self.num_chunks):
-            self.wait_for_forward_group(group_idx)
-
-    def is_forward_ready(self) -> bool:
-        return all(self.is_forward_group_ready(group_idx) for group_idx in range(self.num_chunks))
-
-    def wait_update_ready(self) -> None:
-        t0 = time.time()
-        for group_idx in range(self.num_chunks):
-            self.wait_for_update_group(group_idx)
-        self._add_restore_stat("update_barrier_wait_s", time.time() - t0)
-
-    def is_update_ready(self) -> bool:
-        return all(self.is_update_group_ready(group_idx) for group_idx in range(self.num_chunks))
 
     def wait_for_chunk(self, chunk_idx: int) -> None:
-        """Backward-compatible full-restore wait: waits for update-ready."""
-        self.wait_for_update_group(chunk_idx)
+        """等待 chunk 的 param 流就绪（forward pre-hook 语义）。"""
+        self._wait_phase(chunk_idx, self._param_done_cpu, self.param_events)
+
+    def wait_for_chunk_full(self, chunk_idx: int) -> None:
+        """等待 chunk 的全部状态流（moments/master）就绪。"""
+        self._wait_phase(chunk_idx, self._full_done_cpu, self.full_events)
+
+    def wait_all_full(self) -> None:
+        """阻塞到所有 chunk 的全部状态流恢复完成——首个 optimizer.step 前的屏障。"""
+        for i in range(self.num_chunks):
+            self.wait_for_chunk_full(i)
 
     def is_chunk_loaded(self, chunk_idx: int) -> bool:
-        """Backward-compatible full-restore query: true only after update-ready."""
-        return self.is_update_group_ready(chunk_idx)
+        """param 流是否就绪（worker 在 stream.synchronize 后置位 ⇒ 数据已上卡）。"""
+        self._raise_if_fatal_error()
+        if 0 <= chunk_idx < self.num_chunks:
+            return bool(self._chunk_param_loaded[chunk_idx])
+        return False
+
+    def is_chunk_fully_loaded(self, chunk_idx: int) -> bool:
+        self._raise_if_fatal_error()
+        if 0 <= chunk_idx < self.num_chunks:
+            return bool(self._chunk_full_loaded[chunk_idx])
+        return False
+
+    # ============ distributed.py 兼容薄层（多卡 PP 恢复 API，源自 distributed 分支） ============
+    # ForwardLoadGate / PipelayerAsyncLoadHandle 依赖以下命名。
+    # 语义映射：param 级就绪 = forward 可跑（weights-first phase A）；
+    #          full 级就绪 = optimizer 可更新（phase B，moments/master 全部上卡）。
+
+    def is_forward_group_ready(self, chunk_idx: int) -> bool:
+        return self.is_chunk_loaded(chunk_idx)
+
+    def wait_for_forward_group(self, chunk_idx: int) -> None:
+        self.wait_for_chunk(chunk_idx)
+
+    def is_forward_ready(self) -> bool:
+        return all(self.is_chunk_loaded(i) for i in range(self.num_chunks))
+
+    def wait_forward_ready(self) -> None:
+        for i in range(self.num_chunks):
+            self.wait_for_chunk(i)
+
+    def is_update_ready(self) -> bool:
+        return all(self.is_chunk_fully_loaded(i) for i in range(self.num_chunks))
+
+    def wait_update_ready(self) -> None:
+        self.wait_all_full()
+
+    def get_restore_stats(self) -> Dict[str, Any]:
+        return {
+            "num_chunks": int(self.num_chunks),
+            "param_chunks_loaded": sum(
+                1 for i in range(self.num_chunks) if self.is_chunk_loaded(i)),
+            "full_chunks_loaded": sum(
+                1 for i in range(self.num_chunks) if self.is_chunk_fully_loaded(i)),
+            "weights_first": bool(self.weights_first),
+        }
 
     def __del__(self) -> None:
         try:

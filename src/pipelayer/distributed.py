@@ -191,7 +191,9 @@ class ForwardLoadGate:
         named_modules = dict(self.model.named_modules())
         module_to_chunks: Dict[str, Set[int]] = {}
 
-        for param_name, chunk_idx in self.loader.param_name_to_chunk.items():
+        # v3 语义：param_name_to_chunks 的值是 chunk 集合——split 分组下一个张量
+        # 可能横跨多个 chunk，pre-hook 必须等它的全部覆盖 chunk（单值映射是旧 bug）。
+        for param_name, chunk_ids in self.loader.param_name_to_chunks.items():
             module_name = param_name.rsplit(".", 1)[0] if "." in param_name else ""
             while module_name not in named_modules and "." in module_name:
                 module_name = module_name.rsplit(".", 1)[0]
@@ -200,7 +202,8 @@ class ForwardLoadGate:
                 if len(self._root_fallback_param_examples) < 8:
                     self._root_fallback_param_examples.append(param_name)
                 module_name = ""
-            module_to_chunks.setdefault(module_name, set()).add(int(chunk_idx))
+            module_to_chunks.setdefault(module_name, set()).update(
+                int(c) for c in chunk_ids)
 
         for module_name, chunk_ids in module_to_chunks.items():
             if not chunk_ids:
