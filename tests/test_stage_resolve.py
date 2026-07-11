@@ -61,7 +61,7 @@ for rank in range(args.ranks):
     raw = np.memmap(chk, dtype=np.uint8, mode="r",
                     offset=byte_pos, shape=(extra_floats * 4,))
     try:
-        blob = MultiStreamCheckpoint.parse_extra_state_blob(bytes(raw))
+        blob, _plen = MultiStreamCheckpoint.parse_extra_state_blob(bytes(raw))
         check("extra blob crc + parse", True,
               f"(optimizer_step={blob.get('optimizer_step')}, "
               f"parall_iter={blob.get('parall_iter')})")
