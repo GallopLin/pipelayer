@@ -33,8 +33,14 @@ def _ms_format():
     """加载保存侧格式模块 multistream_checkpoint（惰性、进程内单例）。"""
     global _ms_format_module
     if _ms_format_module is None:
+        # 优先复用调用方已导入的保存端模块（包形式导入时 sys.path 上没有顶层模块，
+        # 旧逻辑会回退到默认目录，可能加载另一份、版本不同的格式代码）
+        pkg_mod = sys.modules.get("checkpoint_eval.pccheck.multistream_checkpoint")
         try:
-            import multistream_checkpoint as m  # 调用方已注入 sys.path 的情形
+            if pkg_mod is not None:
+                m = pkg_mod
+            else:
+                import multistream_checkpoint as m  # 调用方已注入 sys.path 的情形
         except ImportError:
             ms_dir = os.environ.get(_MS_FORMAT_DIR_ENV, _MS_FORMAT_DEFAULT_DIR)
             path = os.path.join(ms_dir, "multistream_checkpoint.py")
@@ -47,6 +53,7 @@ def _ms_format():
             sys.modules["multistream_checkpoint"] = m
             spec.loader.exec_module(m)
         _ms_format_module = m
+        print(f"[pipelayer] checkpoint format module: {getattr(m, '__file__', m)}")
     return _ms_format_module
 
 
@@ -584,16 +591,16 @@ class MultiStreamStateLoader:
         self._init_reader(lib_path)
         self._init_pinned_pool()
 
-        # 优先从 metadata 读取 latest_parall_iter，避免调用可能崩溃的 C++ 接口
+        # 选版本：以文件头的已发布记录为准（C++ 在 durability barrier + CAS 之后持久化，
+        # 且先更新它才回收旧 slot）。metadata 的 latest_parall_iter / training_state 的
+        # slot 写在发布之外的时刻，崩溃时可能指向在途或已复用的 slot，只作旧格式回退。
+        self.published_counter: Optional[int] = None
+        self.slot_source = "explicit"
         if parall_iter is None:
-            parall_iter = self.metadata.get("latest_parall_iter")
-        if parall_iter is None:
-            # C++ 的 get_latest_parall_iter 存在段错误风险，直接默认使用 0
-            # 对于旧版本 metadata（没有 latest_parall_iter 字段），使用 0 是安全的
-            print("[WARN] latest_parall_iter not found in metadata, defaulting to 0")
-            parall_iter = 0
+            parall_iter, self.published_counter, self.slot_source = self._resolve_published_slot()
         self.parall_iter = int(parall_iter)
-        print(f"[MultiStreamStateLoader] Using parall_iter={self.parall_iter}")
+        print(f"[MultiStreamStateLoader] Using parall_iter={self.parall_iter} "
+              f"(source={self.slot_source}, counter={self.published_counter})")
 
         # slot 已定 → 先读 extra blob：其中的 optimizer_step 是 finalize 时刻的
         # 真实值（metadata 的 optimizer_steps 存在"槽号回填"历史 kludge），
@@ -608,6 +615,11 @@ class MultiStreamStateLoader:
                     print(f"[MultiStreamStateLoader] optimizer step from extra blob: "
                           f"{self.global_optimizer_step}")
             except Exception as e:
+                if self.slot_source == "published":
+                    # 已发布 slot 的 blob 校验失败 = 数据损坏，不能带病恢复
+                    raise RuntimeError(
+                        f"extra-state blob of published slot {self.parall_iter} failed "
+                        f"verification: {e}") from e
                 print(f"[WARN] early extra-state read failed: {e}")
 
         # 预建全部 optimizer state（zeros + step）：copy worker 热路径零分配、
@@ -1038,6 +1050,31 @@ class MultiStreamStateLoader:
         if sqrt_domain:
             deq = deq.square()  # 保存端在 sqrt 域量化，恢复端平方还原
         dst_flat.copy_(deq)
+
+    def _resolve_published_slot(self):
+        """返回 (slot, counter, source)。新格式文件读已发布记录；从未发布则报错；
+        旧格式文件回退 metadata 的 latest_parall_iter（崩溃一致性无保证，打警告）。"""
+        rec = _ms_format().read_published_checkpoint(self.checkpoint_file, self.max_async)
+        if rec["status"] == "published":
+            hint = self.metadata.get("latest_parall_iter")
+            if hint is not None and int(hint) != rec["slot"]:
+                print(f"[WARN] metadata latest_parall_iter={hint} disagrees with published "
+                      f"record slot={rec['slot']}; using the published record")
+            return rec["slot"], rec["counter"], "published"
+        if rec["status"] == "none":
+            raise RuntimeError(
+                f"{self.checkpoint_file}: no checkpoint has been published yet "
+                f"(registered slots may hold partial data)")
+        hint = self.metadata.get("latest_parall_iter")
+        print(f"[WARN] {self.checkpoint_file}: legacy file without published record; "
+              f"falling back to metadata latest_parall_iter={hint} (not crash-consistent)")
+        return int(hint if hint is not None else 0), None, "legacy-metadata"
+
+    @property
+    def published_payload(self) -> Optional[Dict[str, Any]]:
+        """该 slot extra blob 中由保存端写入的发布载荷（如 PP 的 completed_steps）。"""
+        st = getattr(self, "_extra_state_early", None) or {}
+        return st.get("publish_payload")
 
     # ================== 非分层状态（extra state, CSXS blob） ==================
     def load_extra_state(self) -> Optional[Dict[str, Any]]:

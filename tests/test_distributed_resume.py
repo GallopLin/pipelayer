@@ -98,8 +98,8 @@ with open(os.path.join(args.ckpt_dir, "training_state.json"), "w") as f:
 resolved = resolve_multistream_checkpoint(args.ckpt_dir, rank=0)
 check("resolve single-process layout",
       resolved.checkpoint_file == os.path.basename(CKPT)
-      and resolved.parall_iter == int(truth["final_slot"]),
-      f"(slot={resolved.parall_iter})")
+      and resolved.parall_iter is None,
+      "(slot chosen by loader from the published record)")
 
 # 2. 零初始化模型（证明数据来自 checkpoint 而非初始化）+ 预建 optimizer state
 torch.manual_seed(12345)
@@ -161,6 +161,10 @@ check("moments restored (β-decay reversed)", n_bad_m == 0, f"(mismatch={n_bad_m
 stats = handle.get_restore_stats()
 check("restore stats", stats.get("num_chunks", 0) > 0
       and stats["full_chunks_loaded"] == stats["num_chunks"], f"({stats})")
+check("loader picked the published slot",
+      handle.loader.parall_iter == int(truth["final_slot"])
+      and handle.loader.slot_source == "published",
+      f"(slot={handle.loader.parall_iter}, source={handle.loader.slot_source})")
 extra = handle.loader.load_extra_state()
 check("extra state blob readable", extra is not None
       and int(extra.get("optimizer_step", -1)) == int(truth["step"]),

@@ -118,7 +118,8 @@ def resolve_multistream_checkpoint(
             lib_path=info.get("lib_path") or lib_path or "",
             rank=resolved_rank,
             training_state=training_state,
-            parall_iter=training_state.get("slot"),
+            # training_state.json 的 slot 只是提示；由 loader 读文件头已发布记录选版本
+            parall_iter=None,
         )
 
     # Single-process multistream layout.
@@ -134,7 +135,8 @@ def resolve_multistream_checkpoint(
             lib_path=info.get("lib_path") or lib_path or "",
             rank=resolved_rank,
             training_state=training_state,
-            parall_iter=training_state.get("slot"),
+            # training_state.json 的 slot 只是提示；由 loader 读文件头已发布记录选版本
+            parall_iter=None,
         )
 
     # DistributedMultiStreamCheckpoint layout.
@@ -246,6 +248,33 @@ class ForwardLoadGate:
                 handle.remove()
             self._handles.clear()
             self._removed = True
+
+
+def _reconcile_training_state(json_state, loader, rank):
+    """以 extra blob 中的发布载荷为准（与数据同 slot 原子发布）；JSON 只作补充。
+    多 rank 时核对各 rank 恢复到的 completed_steps 一致，否则拒绝恢复。"""
+    state = dict(json_state or {})
+    payload = loader.published_payload
+    if payload:
+        js = state.get("completed_steps")
+        bs = payload.get("completed_steps")
+        if js is not None and bs is not None and int(js) != int(bs):
+            print(f"[WARN] rank {rank}: training_state.json completed_steps={js} != "
+                  f"published blob {bs}; using the published value")
+        state.update(payload)
+    state["slot"] = int(loader.parall_iter)
+    state["slot_source"] = loader.slot_source
+    state["published_counter"] = loader.published_counter
+    if torch.distributed.is_available() and torch.distributed.is_initialized() \
+            and torch.distributed.get_world_size() > 1:
+        mine = state.get("completed_steps")
+        allv = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(allv, mine)
+        if len({v for v in allv}) != 1:
+            raise RuntimeError(
+                f"inconsistent per-rank checkpoints: completed_steps by rank = {allv}; "
+                f"stages published different steps (crash between per-stage publishes)")
+    return state
 
 
 class PipelayerAsyncLoadHandle:
@@ -414,11 +443,12 @@ def start_distributed_multistream_resume(
         forward_prefetch_window=forward_prefetch_window,
         restore_schedule_policy=restore_schedule_policy,
     )
+    training_state = _reconcile_training_state(resolved.training_state, loader, resolved.rank)
     gate = ForwardLoadGate(model, loader) if install_forward_hooks else None
     handle = PipelayerAsyncLoadHandle(
         loader=loader,
         gate=gate,
-        training_state=resolved.training_state,
+        training_state=training_state,
         rank=resolved.rank,
     )
     if guard_optimizer_step:
