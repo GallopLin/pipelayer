@@ -1044,7 +1044,14 @@ class MultiStreamStateLoader:
             raise ValueError(f"quant region size {src_region.numel()} != expected {expected}")
         region = src_region.to(self.device, non_blocking=self.device.type == "cuda")
         region = region.view(nb_piece, unit)
-        payload = region[:, :unit - 1].contiguous().view(torch.int8).view(nb_piece, block).float()
+        codes = region[:, :unit - 1].contiguous().view(torch.int8).view(nb_piece, block)
+        codec = quant_meta.get("codec") or "int8"
+        if codec == "int8":
+            payload = codes.float()
+        elif codec == "fp8_e4m3":
+            payload = codes.view(torch.float8_e4m3fn).float()
+        else:
+            raise ValueError(f"unsupported quant codec {codec!r}")
         scale = region[:, unit - 1].unsqueeze(1)
         deq = (payload * scale).view(-1)[: pe - ps]
         if sqrt_domain:
